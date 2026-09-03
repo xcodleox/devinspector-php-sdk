@@ -1,0 +1,30 @@
+{
+  "name": "devinspector/audit-sdk",
+  "description": "SDK oficial do DevInspector para PHP e Laravel",
+  "type": "library",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "DevInspector\\": "src/"
+    },
+    "files": [
+      "src/AuditCore.php"
+    ]
+  },
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*"
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "DevInspector\\Laravel\\AuditServiceProvider"
+      ],
+      "aliases": {
+        "Audit": "DevInspector\\Laravel\\Facades\\Audit"
+      }
+    }
+  }
+}
