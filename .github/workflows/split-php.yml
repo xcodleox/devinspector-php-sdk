@@ -1,0 +1,27 @@
+name: Split & Sync PHP SDK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'php-v*'
+
+jobs:
+  subtree-split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push PHP subtree
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.SUBTREE_SPLIT_TOKEN }}
+        with:
+          source-directory: 'php'
+          destination-github-username: 'xcodleox'
+          destination-repository-name: 'devinspector-php-sdk'
+          user-email: dev@devinspector.com.br
+          target-branch: main
