@@ -7,6 +7,12 @@ use ErrorException;
 use DateTime;
 use DateTimeZone;
 
+class RequestContext
+{
+    public int $queriesCount = 0;
+    public float $slowQueries = 0.0;
+}
+
 class AuditCore
 {
     private string $apiKey = "PENDING_API_KEY";
@@ -14,6 +20,9 @@ class AuditCore
     private string $environment = "production";
     public bool $initialized = false;
     private bool $listenersAttached = false;
+
+    // Contexto estático para isolar métricas de APM por requisição
+    private static ?RequestContext $requestContext = null;
 
     private static ?AuditCore $instance = null;
 
@@ -25,6 +34,22 @@ class AuditCore
             self::$instance = new self();
         }
         return self::$instance;
+    }
+
+    // Gerenciamento de Contexto para Middlewares
+    public static function beginRequest(): void
+    {
+        self::$requestContext = new RequestContext();
+    }
+
+    public static function getRequestContext(): ?RequestContext
+    {
+        return self::$requestContext;
+    }
+
+    public static function clearRequest(): void
+    {
+        self::$requestContext = null;
     }
 
     public function init(string $apiKey, ?string $endpoint = null, ?string $environment = null): void
@@ -42,19 +67,34 @@ class AuditCore
         $this->listenGlobalErrors();
     }
 
-    public function captureRequest(string $method, string $url, int $statusCode, float $durationMs, string $userAgent = ''): void
-    {
+    // Sobrecarga mantendo retrocompatibilidade + suporte APM
+    public function captureRequest(
+        string $method, 
+        string $url, 
+        int $statusCode, 
+        float $durationMs, 
+        string $userAgent = '',
+        ?string $route = null,
+        int $dbQueriesCount = 0,
+        float $slowQueryMs = 0.0
+    ): void {
+        $metadata = [
+            'environment' => $this->environment,
+            'timestamp' => $this->getIsoTimestamp(),
+            'route' => !empty($route) ? $route : $url,
+            'dbQueriesCount' => $dbQueriesCount,
+            'slowQueryMs' => round($slowQueryMs, 2),
+        ];
+
         $payload = [
             'type' => 'request_metric',
+            'message' => "{$method} {$url} - {$statusCode}",
             'method' => $method,
             'url' => $url,
             'statusCode' => $statusCode,
             'durationMs' => round($durationMs, 2),
             'browser' => $userAgent,
-            'metadata' => [
-                'environment' => $this->environment,
-                'timestamp' => $this->getIsoTimestamp(),
-            ],
+            'metadata' => $metadata,
         ];
 
         $this->send($payload);
@@ -108,17 +148,46 @@ class AuditCore
         $this->send($payload);
     }
 
+    // Utilitário de APM para monitorar operações de banco/serviços
+    public function traceOperation(string $operationName, float $thresholdMs, callable $operation): mixed
+    {
+        if (self::$requestContext !== null) {
+            self::$requestContext->queriesCount++;
+        }
+
+        $start = microtime(true);
+        try {
+            $result = $operation();
+            $durationMs = (microtime(true) - $start) * 1000;
+
+            if ($durationMs > $thresholdMs && self::$requestContext !== null) {
+                self::$requestContext->slowQueries = max(self::$requestContext->slowQueries, $durationMs);
+                $this->captureMessage("Slow Query detectada em [{$operationName}]", [
+                    'durationMs' => $durationMs,
+                    'operationName' => $operationName
+                ]);
+            }
+
+            return $result;
+        } catch (Throwable $e) {
+            $durationMs = (microtime(true) - $start) * 1000;
+            $this->captureException($e, [
+                'operationName' => $operationName,
+                'durationMs' => $durationMs
+            ]);
+            throw $e;
+        }
+    }
+
     private function listenGlobalErrors(): void
     {
         if ($this->listenersAttached) return;
         $this->listenersAttached = true;
 
-        // Captura exceções não tratadas
         set_exception_handler(function (Throwable $exception) {
             $this->captureError($exception, ['type' => 'uncaught_exception']);
         });
 
-        // Converte erros do PHP em ErrorException para envio
         set_error_handler(function ($severity, $message, $file, $line) {
             if (!(error_reporting() & $severity)) {
                 return false;
@@ -200,7 +269,6 @@ class AuditCore
     }
 }
 
-// Helper Singleton global
 function audit(): AuditCore
 {
     return AuditCore::getInstance();
