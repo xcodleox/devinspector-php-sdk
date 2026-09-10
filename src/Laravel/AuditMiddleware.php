@@ -10,6 +10,13 @@ class AuditMiddleware
 {
     public function handle(Request $request, Closure $next)
     {
+        $audit = AuditCore::getInstance();
+
+        // Evita monitorar requisições direcionadas ao próprio endpoint de ingestão
+        if ($audit->isIngestUrl($request->fullUrl())) {
+            return $next($request);
+        }
+
         // Inicia o contexto de APM para esta requisição
         AuditCore::beginRequest();
 
@@ -24,7 +31,7 @@ class AuditMiddleware
         $dbQueriesCount = $ctx ? $ctx->queriesCount : 0;
         $slowQueryMs = $ctx ? $ctx->slowQueries : 0.0;
 
-        AuditCore::getInstance()->captureRequest(
+        $audit->captureRequest(
             method: $request->method(),
             url: $request->fullUrl(),
             statusCode: $response->getStatusCode(),

@@ -67,6 +67,38 @@ class AuditCore
         $this->listenGlobalErrors();
     }
 
+    /**
+     * Verifica dinamicamente se uma URL pertence ao servidor de ingestão do Dev Inspector.
+     * Evita chamadas em loop em ambientes self-hosted (Coolify, VPS, etc).
+     */
+    public function isIngestUrl(string $targetUrl): bool
+    {
+        if (empty(trim($targetUrl))) {
+            return false;
+        }
+
+        try {
+            if (!empty($this->endpoint) && str_contains($targetUrl, $this->endpoint)) {
+                return true;
+            }
+
+            $endpointUri = parse_url($this->endpoint);
+            if ($endpointUri !== false) {
+                $host = $endpointUri['host'] ?? '';
+                $path = $endpointUri['path'] ?? '';
+
+                if ((!empty($host) && str_contains($targetUrl, $host)) || 
+                    (!empty($path) && str_contains($targetUrl, $path))) {
+                    return true;
+                }
+            }
+
+            return str_contains($targetUrl, "devinspector.com.br") || str_contains($targetUrl, "/ingest/track");
+        } catch (Throwable) {
+            return str_contains($targetUrl, "devinspector.com.br") || str_contains($targetUrl, "/ingest/track");
+        }
+    }
+
     // Sobrecarga mantendo retrocompatibilidade + suporte APM
     public function captureRequest(
         string $method, 
