@@ -5,6 +5,7 @@ namespace DevInspector\Laravel;
 use Closure;
 use Illuminate\Http\Request;
 use DevInspector\AuditCore;
+use Throwable;
 
 class AuditMiddleware
 {
@@ -12,39 +13,102 @@ class AuditMiddleware
     {
         $audit = AuditCore::getInstance();
 
-        // Evita monitorar requisições direcionadas ao próprio endpoint de ingestão
         if ($audit->isIngestUrl($request->fullUrl())) {
             return $next($request);
         }
 
-        // Inicia o contexto de APM para esta requisição
-        AuditCore::beginRequest();
+        $requestId = $request->header('x-devinspector-request-id');
+        $traceId = $request->header('x-devinspector-trace-id');
+        $spanId = $request->header('x-devinspector-span-id');
 
-        $startTime = microtime(true);
-
-        $response = $next($request);
-
-        $durationMs = (microtime(true) - $startTime) * 1000;
-
-        // Recupera os contadores computados durante o ciclo da requisição
-        $ctx = AuditCore::getRequestContext();
-        $dbQueriesCount = $ctx ? $ctx->queriesCount : 0;
-        $slowQueryMs = $ctx ? $ctx->slowQueries : 0.0;
-
-        $audit->captureRequest(
-            method: $request->method(),
-            url: $request->fullUrl(),
-            statusCode: $response->getStatusCode(),
-            durationMs: $durationMs,
-            userAgent: $request->userAgent() ?? '',
-            route: $request->route() ? $request->route()->uri() : $request->path(),
-            dbQueriesCount: $dbQueriesCount,
-            slowQueryMs: $slowQueryMs
+        AuditCore::beginRequest(
+            $requestId,
+            $traceId,
+            $spanId,
+            $request->fullUrl()
         );
 
-        // Limpa o contexto para evitar vazamento de estado
-        AuditCore::clearRequest();
+        $ctx = AuditCore::getRequestContext();
 
-        return $response;
+        try {
+            $request->headers->set(
+                'x-devinspector-request-id',
+                $ctx?->requestId ?? ''
+            );
+
+            $request->headers->set(
+                'x-devinspector-trace-id',
+                $ctx?->traceId ?? ''
+            );
+
+            $request->headers->set(
+                'x-devinspector-span-id',
+                $ctx?->spanId ?? ''
+            );
+
+            $startTime = microtime(true);
+
+            try {
+                $response = $next($request);
+            } catch (Throwable $exception) {
+                $durationMs = (microtime(true) - $startTime) * 1000;
+
+                $audit->captureException($exception, [
+                    'method' => $request->method(),
+                    'url' => $request->fullUrl(),
+                    'durationMs' => round($durationMs, 2),
+                ]);
+
+                throw $exception;
+            }
+
+            $durationMs = (microtime(true) - $startTime) * 1000;
+
+            $ctx = AuditCore::getRequestContext();
+
+            $dbQueriesCount = $ctx?->queriesCount ?? 0;
+            $slowQueryMs = $ctx?->slowQueries ?? 0.0;
+
+            $isError = $response->getStatusCode() >= 400;
+            $isSlowRequest = $durationMs >= $audit->getSlowThresholdMs();
+            $hasSlowQuery = $slowQueryMs > 0;
+
+            if ($isError || $isSlowRequest || $hasSlowQuery) {
+                $audit->captureRequest(
+                    method: $request->method(),
+                    url: $request->fullUrl(),
+                    statusCode: $response->getStatusCode(),
+                    durationMs: $durationMs,
+                    userAgent: $request->userAgent() ?? '',
+                    route: $request->route()
+                        ? $request->route()->uri()
+                        : $request->path(),
+                    dbQueriesCount: $dbQueriesCount,
+                    slowQueryMs: $slowQueryMs,
+                    requestId: $ctx?->requestId,
+                    traceId: $ctx?->traceId,
+                    spanId: $ctx?->spanId
+                );
+            }
+
+            $response->headers->set(
+                'x-devinspector-request-id',
+                $ctx?->requestId ?? ''
+            );
+
+            $response->headers->set(
+                'x-devinspector-trace-id',
+                $ctx?->traceId ?? ''
+            );
+
+            $response->headers->set(
+                'x-devinspector-span-id',
+                $ctx?->spanId ?? ''
+            );
+
+            return $response;
+        } finally {
+            AuditCore::clearRequest();
+        }
     }
 }
