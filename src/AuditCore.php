@@ -11,18 +11,57 @@ class RequestContext
 {
     public int $queriesCount = 0;
     public float $slowQueries = 0.0;
+
     public ?string $requestId = null;
     public ?string $traceId = null;
     public ?string $spanId = null;
+
     public string $url = '';
 }
 
 class AuditCore
 {
-    private string $apiKey = "PENDING_API_KEY";
-    private string $endpoint = "https://api.devinspector.com.br/api/ingest/track";
-    private string $environment = "production";
+    private const DEFAULT_ENDPOINT =
+        'https://api.devinspector.com.br/api/ingest/track';
+
+    private const MAX_BREADCRUMBS = 50;
+    private const MAX_MESSAGE_LENGTH = 500;
+    private const MAX_STACK_TRACE_LENGTH = 10000;
+    private const MAX_METADATA_STRING_LENGTH = 5000;
+    private const MAX_METRIC_NAME_LENGTH = 200;
+    private const MAX_ARRAY_ITEMS = 100;
+    private const MAX_SANITIZE_DEPTH = 10;
+
+    private const SENSITIVE_KEYS = [
+        'password',
+        'passwd',
+        'pwd',
+        'secret',
+        'token',
+        'access_token',
+        'refresh_token',
+        'api_key',
+        'apikey',
+        'authorization',
+        'cookie',
+        'set_cookie',
+        'credit_card',
+        'card_number',
+        'cvv',
+        'cvc',
+        'ssn',
+        'private_key',
+        'client_secret',
+    ];
+
+    private string $apiKey = 'PENDING_API_KEY';
+
+    private string $endpoint = self::DEFAULT_ENDPOINT;
+
+    private string $environment = 'production';
+
     private ?string $release = null;
+
     private float $slowThresholdMs = 300.0;
 
     public bool $initialized = false;
@@ -33,7 +72,13 @@ class AuditCore
 
     private static ?AuditCore $instance = null;
 
-    private function __construct() {}
+    private ?array $user = null;
+
+    private array $breadcrumbs = [];
+
+    private function __construct()
+    {
+    }
 
     public static function getInstance(): AuditCore
     {
@@ -99,25 +144,32 @@ class AuditCore
         ?float $slowThresholdMs = null
     ): void {
         if (empty(trim($apiKey))) {
-            error_log("[AuditSDK] API Key não fornecida no init().");
+            error_log(
+                '[AuditSDK] API Key não fornecida no init().'
+            );
+
             return;
         }
 
-        $this->apiKey = $apiKey;
+        $this->apiKey = trim($apiKey);
 
         if (!empty($endpoint)) {
-            $this->endpoint = $endpoint;
+            $this->endpoint = rtrim(trim($endpoint), '/');
         }
 
         if (!empty($environment)) {
-            $this->environment = $environment;
+            $this->environment = trim($environment);
         }
 
-        if (!empty($release)) {
-            $this->release = $release;
+        if ($release !== null && trim($release) !== '') {
+            $this->release = trim($release);
         }
 
-        if ($slowThresholdMs !== null && $slowThresholdMs >= 0) {
+        if (
+            $slowThresholdMs !== null &&
+            is_finite($slowThresholdMs) &&
+            $slowThresholdMs >= 0
+        ) {
             $this->slowThresholdMs = $slowThresholdMs;
         }
 
@@ -143,37 +195,51 @@ class AuditCore
 
     public function isIngestUrl(string $targetUrl): bool
     {
-        if (empty(trim($targetUrl))) {
+        $targetUrl = trim($targetUrl);
+
+        if ($targetUrl === '') {
             return false;
         }
 
         try {
-            if (
-                !empty($this->endpoint) &&
-                str_contains($targetUrl, $this->endpoint)
-            ) {
-                return true;
-            }
-
+            $targetUri = parse_url($targetUrl);
             $endpointUri = parse_url($this->endpoint);
 
-            if ($endpointUri !== false) {
-                $host = $endpointUri['host'] ?? '';
-                $path = $endpointUri['path'] ?? '';
-
-                if (
-                    (!empty($host) && str_contains($targetUrl, $host)) ||
-                    (!empty($path) && str_contains($targetUrl, $path))
-                ) {
-                    return true;
-                }
+            if (
+                $targetUri === false ||
+                $endpointUri === false
+            ) {
+                return false;
             }
 
-            return str_contains($targetUrl, 'devinspector.com.br') ||
-                str_contains($targetUrl, '/ingest/track');
+            $targetHost = strtolower(
+                $targetUri['host'] ?? ''
+            );
+
+            $endpointHost = strtolower(
+                $endpointUri['host'] ?? ''
+            );
+
+            $targetPath = $this->normalizePath(
+                $targetUri['path'] ?? ''
+            );
+
+            $endpointPath = $this->normalizePath(
+                $endpointUri['path'] ?? ''
+            );
+
+            if (
+                $targetHost === '' ||
+                $endpointHost === ''
+            ) {
+                return false;
+            }
+
+            return
+                $targetHost === $endpointHost &&
+                $targetPath === $endpointPath;
         } catch (Throwable) {
-            return str_contains($targetUrl, 'devinspector.com.br') ||
-                str_contains($targetUrl, '/ingest/track');
+            return false;
         }
     }
 
@@ -188,37 +254,69 @@ class AuditCore
         float $slowQueryMs = 0.0,
         ?string $requestId = null,
         ?string $traceId = null,
-        ?string $spanId = null
+        ?string $spanId = null,
+        array $metadata = []
     ): void {
+        if (
+            !$this->initialized ||
+            trim($url) === '' ||
+            trim($method) === ''
+        ) {
+            return;
+        }
+
+        if ($this->isIngestUrl($url)) {
+            return;
+        }
+
         $context = self::$requestContext;
 
         $requestId ??= $context?->requestId;
         $traceId ??= $context?->traceId;
         $spanId ??= $context?->spanId;
 
-        $metadata = [
-            'environment' => $this->environment,
-            'timestamp' => $this->getIsoTimestamp(),
-            'route' => !empty($route) ? $route : $url,
-            'dbQueriesCount' => $dbQueriesCount,
-            'slowQueryMs' => round($slowQueryMs, 2),
-        ];
+        $method = strtoupper(trim($method));
 
-        $payload = [
-            'type' => 'request_metric',
-            'message' => "{$method} {$url} - {$statusCode}",
-            'method' => $method,
-            'url' => $url,
-            'statusCode' => $statusCode,
-            'durationMs' => round($durationMs, 2),
-            'browser' => $userAgent,
-            'environment' => $this->environment,
-            'release' => $this->release,
-            'requestId' => $requestId ?? '',
-            'traceId' => $traceId ?? '',
-            'spanId' => $spanId ?? '',
-            'metadata' => $metadata,
-        ];
+        $meta = array_merge(
+            $metadata,
+            [
+                'environment' => $this->environment,
+                'timestamp' => $this->getIsoTimestamp(),
+                'route' => !empty($route)
+                    ? $route
+                    : $url,
+                'dbQueriesCount' => max(0, $dbQueriesCount),
+                'slowQueryMs' => round(
+                    max(0.0, $slowQueryMs),
+                    2
+                ),
+            ]
+        );
+
+        $payload = $this->createBasePayload(
+            'request_metric'
+        );
+
+        $payload['message'] =
+            "{$method} {$url} - {$statusCode}";
+
+        $payload['method'] = $method;
+        $payload['url'] = $url;
+        $payload['statusCode'] = $statusCode;
+        $payload['durationMs'] = round(
+            max(0.0, $durationMs),
+            2
+        );
+        $payload['browser'] = $userAgent;
+
+        $this->addCorrelationIds(
+            $payload,
+            $requestId,
+            $traceId,
+            $spanId
+        );
+
+        $payload['metadata'] = $meta;
 
         $this->send($payload);
     }
@@ -233,33 +331,61 @@ class AuditCore
         ?string $spanId = null,
         array $metadata = []
     ): void {
+        if (!$this->initialized) {
+            return;
+        }
+
         $context = self::$requestContext;
 
         $requestId ??= $context?->requestId;
         $traceId ??= $context?->traceId;
         $spanId ??= $context?->spanId;
+
         $url ??= $context?->url ?? '';
 
-        $meta = array_merge($metadata, [
-            'collection' => $collection ?? '',
-            'operation' => $operation,
-            'durationMs' => round($durationMs, 2),
-            'environment' => $this->environment,
-            'timestamp' => $this->getIsoTimestamp(),
-        ]);
+        $operation = trim($operation);
 
-        $payload = [
-            'type' => 'db_query',
-            'message' => "DB {$operation}",
-            'url' => $url,
-            'durationMs' => round($durationMs, 2),
-            'environment' => $this->environment,
-            'release' => $this->release,
-            'requestId' => $requestId ?? '',
-            'traceId' => $traceId ?? '',
-            'spanId' => $spanId ?? '',
-            'metadata' => $this->truncate($meta, 5000),
-        ];
+        if ($operation === '') {
+            $operation = 'unknown';
+        }
+
+        $durationMs = max(0.0, $durationMs);
+
+        $meta = array_merge(
+            $metadata,
+            [
+                'collection' => $collection ?? '',
+                'operation' => $operation,
+                'durationMs' => round(
+                    $durationMs,
+                    2
+                ),
+                'environment' => $this->environment,
+                'timestamp' => $this->getIsoTimestamp(),
+            ]
+        );
+
+        $payload = $this->createBasePayload(
+            'db_query'
+        );
+
+        $payload['message'] =
+            "DB {$operation}";
+
+        $payload['url'] = $url;
+        $payload['durationMs'] = round(
+            $durationMs,
+            2
+        );
+
+        $this->addCorrelationIds(
+            $payload,
+            $requestId,
+            $traceId,
+            $spanId
+        );
+
+        $payload['metadata'] = $meta;
 
         $this->send($payload);
     }
@@ -268,30 +394,61 @@ class AuditCore
         Throwable $error,
         array $metadata = []
     ): void {
+        if (!$this->initialized) {
+            return;
+        }
+
         $context = self::$requestContext;
 
-        $rawMessage = $error->getMessage() ?: 'Erro Desconhecido';
+        $rawMessage = trim(
+            $error->getMessage()
+        );
+
+        if ($rawMessage === '') {
+            $rawMessage = 'Erro Desconhecido';
+        }
+
         $rawStack = $error->getTraceAsString();
 
-        $meta = array_merge($metadata, [
-            'environment' => $this->environment,
-            'timestamp' => $this->getIsoTimestamp(),
-            'hResult' => $error->getCode(),
-        ]);
+        $meta = array_merge(
+            $metadata,
+            [
+                'environment' => $this->environment,
+                'timestamp' => $this->getIsoTimestamp(),
+                'hResult' => $error->getCode(),
+                'exceptionType' => get_class($error),
+            ]
+        );
 
-        $payload = [
-            'type' => 'error',
-            'message' => $this->truncate($rawMessage, 500),
-            'stackTrace' => $this->truncate($rawStack, 10000),
-            'url' => $context?->url ?: $this->getCurrentUrl(),
-            'browser' => 'PHP/' . PHP_VERSION,
-            'environment' => $this->environment,
-            'release' => $this->release,
-            'requestId' => $context?->requestId ?? '',
-            'traceId' => $context?->traceId ?? '',
-            'spanId' => $context?->spanId ?? '',
-            'metadata' => $this->truncate($meta, 5000),
-        ];
+        $payload = $this->createBasePayload(
+            'error'
+        );
+
+        $payload['message'] = $this->truncate(
+            $rawMessage,
+            self::MAX_MESSAGE_LENGTH
+        );
+
+        $payload['stackTrace'] = $this->truncate(
+            $rawStack,
+            self::MAX_STACK_TRACE_LENGTH
+        );
+
+        $payload['url'] =
+            $context?->url
+            ?: $this->getCurrentUrl();
+
+        $payload['browser'] =
+            'PHP/' . PHP_VERSION;
+
+        $this->addCorrelationIds(
+            $payload,
+            $context?->requestId,
+            $context?->traceId,
+            $context?->spanId
+        );
+
+        $payload['metadata'] = $meta;
 
         $this->send($payload);
     }
@@ -300,37 +457,208 @@ class AuditCore
         Throwable $error,
         array $metadata = []
     ): void {
-        $this->captureError($error, $metadata);
+        $this->captureError(
+            $error,
+            $metadata
+        );
     }
 
     public function captureMessage(
         string $message,
         array $metadata = []
     ): void {
+        if (!$this->initialized) {
+            return;
+        }
+
         $context = self::$requestContext;
 
-        $meta = array_merge([
-            'level' => 'info',
-        ], $metadata, [
-            'environment' => $this->environment,
-            'timestamp' => $this->getIsoTimestamp(),
-        ]);
+        $meta = array_merge(
+            [
+                'level' => 'info',
+            ],
+            $metadata,
+            [
+                'environment' => $this->environment,
+                'timestamp' => $this->getIsoTimestamp(),
+            ]
+        );
 
-        $payload = [
-            'type' => 'message',
-            'message' => $this->truncate($message, 500),
-            'stackTrace' => '',
-            'url' => $context?->url ?: $this->getCurrentUrl(),
-            'browser' => 'PHP/' . PHP_VERSION,
-            'environment' => $this->environment,
-            'release' => $this->release,
-            'requestId' => $context?->requestId ?? '',
-            'traceId' => $context?->traceId ?? '',
-            'spanId' => $context?->spanId ?? '',
-            'metadata' => $this->truncate($meta, 5000),
-        ];
+        $payload = $this->createBasePayload(
+            'message'
+        );
+
+        $payload['message'] = $this->truncate(
+            $message,
+            self::MAX_MESSAGE_LENGTH
+        );
+
+        $payload['stackTrace'] = '';
+
+        $payload['url'] =
+            $context?->url
+            ?: $this->getCurrentUrl();
+
+        $payload['browser'] =
+            'PHP/' . PHP_VERSION;
+
+        $this->addCorrelationIds(
+            $payload,
+            $context?->requestId,
+            $context?->traceId,
+            $context?->spanId
+        );
+
+        $payload['metadata'] = $meta;
 
         $this->send($payload);
+    }
+
+    public function captureMetric(
+        string $metricName,
+        float $metricValue,
+        array $metadata = [],
+        ?string $requestId = null,
+        ?string $traceId = null,
+        ?string $spanId = null
+    ): void {
+        $this->captureCustomMetric(
+            $metricName,
+            $metricValue,
+            $metadata,
+            $requestId,
+            $traceId,
+            $spanId
+        );
+    }
+
+    public function captureCustomMetric(
+        string $metricName,
+        float $metricValue,
+        array $metadata = [],
+        ?string $requestId = null,
+        ?string $traceId = null,
+        ?string $spanId = null
+    ): void {
+        if (!$this->initialized) {
+            return;
+        }
+
+        $metricName = trim($metricName);
+
+        if ($metricName === '') {
+            return;
+        }
+
+        if (
+            !is_finite($metricValue) ||
+            is_nan($metricValue)
+        ) {
+            return;
+        }
+
+        $metricName = $this->truncate(
+            $metricName,
+            self::MAX_METRIC_NAME_LENGTH
+        );
+
+        $context = self::$requestContext;
+
+        $requestId ??= $context?->requestId;
+        $traceId ??= $context?->traceId;
+        $spanId ??= $context?->spanId;
+
+        $meta = array_merge(
+            $metadata,
+            [
+                'environment' => $this->environment,
+                'timestamp' => $this->getIsoTimestamp(),
+            ]
+        );
+
+        $payload = $this->createBasePayload(
+            'custom_metric'
+        );
+
+        $payload['message'] =
+            "Custom metric: {$metricName}";
+
+        $payload['metricName'] = $metricName;
+        $payload['metricValue'] = $metricValue;
+
+        $this->addCorrelationIds(
+            $payload,
+            $requestId,
+            $traceId,
+            $spanId
+        );
+
+        $payload['metadata'] = $meta;
+
+        $this->send($payload);
+    }
+
+    public function setUser(
+        array $user
+    ): void {
+        $this->user = $this->sanitizeArray(
+            $user
+        );
+    }
+
+    public function getUser(): ?array
+    {
+        return $this->user;
+    }
+
+    public function clearUser(): void
+    {
+        $this->user = null;
+    }
+
+    public function addBreadcrumb(
+        string $type,
+        string $message = '',
+        array $metadata = []
+    ): void {
+        $breadcrumb = [
+            'timestamp' => $this->getIsoTimestamp(),
+            'type' => trim($type),
+            'message' => $this->truncate(
+                $message,
+                self::MAX_MESSAGE_LENGTH
+            ),
+        ];
+
+        if (!empty($metadata)) {
+            $breadcrumb['metadata'] =
+                $this->sanitizeArray(
+                    $metadata
+                );
+        }
+
+        $this->breadcrumbs[] =
+            $breadcrumb;
+
+        if (
+            count($this->breadcrumbs) >
+            self::MAX_BREADCRUMBS
+        ) {
+            $this->breadcrumbs = array_slice(
+                $this->breadcrumbs,
+                -self::MAX_BREADCRUMBS
+            );
+        }
+    }
+
+    public function getBreadcrumbs(): array
+    {
+        return $this->breadcrumbs;
+    }
+
+    public function clearBreadcrumbs(): void
+    {
+        $this->breadcrumbs = [];
     }
 
     public function traceOperation(
@@ -349,14 +677,16 @@ class AuditCore
         try {
             $result = $operation();
 
-            $durationMs = (microtime(true) - $start) * 1000;
+            $durationMs =
+                (microtime(true) - $start) * 1000;
 
-            if ($durationMs >= $thresholdMs) {
+            if (
+                $durationMs >=
+                max(0.0, $thresholdMs)
+            ) {
                 if ($context !== null) {
-                    $context->slowQueries = max(
-                        $context->slowQueries,
-                        $durationMs
-                    );
+                    $context->slowQueries +=
+                        $durationMs;
                 }
 
                 $this->captureDbQuery(
@@ -372,12 +702,18 @@ class AuditCore
 
             return $result;
         } catch (Throwable $e) {
-            $durationMs = (microtime(true) - $start) * 1000;
+            $durationMs =
+                (microtime(true) - $start) * 1000;
 
-            $this->captureException($e, [
-                'operationName' => $operationName,
-                'durationMs' => round($durationMs, 2),
-            ]);
+            $this->captureException(
+                $e,
+                [
+                    'operationName' =>
+                        $operationName,
+                    'durationMs' =>
+                        round($durationMs, 2),
+                ]
+            );
 
             throw $e;
         }
@@ -402,20 +738,25 @@ class AuditCore
 
         $this->listenersAttached = true;
 
-        set_exception_handler(function (Throwable $exception) {
-            $this->captureError(
-                $exception,
-                ['type' => 'uncaught_exception']
-            );
-        });
+        set_exception_handler(
+            function (Throwable $exception): void {
+                $this->captureError(
+                    $exception,
+                    [
+                        'type' =>
+                            'uncaught_exception',
+                    ]
+                );
+            }
+        );
 
         set_error_handler(
             function (
-                $severity,
-                $message,
-                $file,
-                $line
-            ) {
+                int $severity,
+                string $message,
+                string $file,
+                int $line
+            ): bool {
                 if (!(error_reporting() & $severity)) {
                     return false;
                 }
@@ -442,75 +783,293 @@ class AuditCore
         );
     }
 
-    private function truncate(
+    private function createBasePayload(
+        string $type
+    ): array {
+        $payload = [
+            'type' => $type,
+            'environment' => $this->environment,
+            'release' => $this->release,
+        ];
+
+        if ($this->user !== null) {
+            $payload['user'] =
+                $this->user;
+        }
+
+        if (!empty($this->breadcrumbs)) {
+            $payload['breadcrumbs'] =
+                $this->breadcrumbs;
+        }
+
+        return $payload;
+    }
+
+    private function addCorrelationIds(
+        array &$payload,
+        ?string $requestId,
+        ?string $traceId,
+        ?string $spanId
+    ): void {
+        if (!empty($requestId)) {
+            $payload['requestId'] =
+                $requestId;
+        }
+
+        if (!empty($traceId)) {
+            $payload['traceId'] =
+                $traceId;
+        }
+
+        if (!empty($spanId)) {
+            $payload['spanId'] =
+                $spanId;
+        }
+    }
+
+    private function sanitizeArray(
+        array $value
+    ): array {
+        $visited = [];
+
+        return $this->sanitizeValue(
+            $value,
+            0,
+            $visited
+        );
+    }
+
+    private function sanitizeValue(
         mixed $value,
-        int $maxLength = 5000
+        int $depth,
+        array &$visited
     ): mixed {
+        if ($depth > self::MAX_SANITIZE_DEPTH) {
+            return '[truncated]';
+        }
+
         if (is_string($value)) {
-            return mb_strlen($value) > $maxLength
-                ? mb_substr($value, 0, $maxLength) . '... [truncated]'
-                : $value;
+            return $this->truncate(
+                $value,
+                self::MAX_METADATA_STRING_LENGTH
+            );
+        }
+
+        if (
+            is_int($value) ||
+            is_bool($value) ||
+            $value === null
+        ) {
+            return $value;
+        }
+
+        if (is_float($value)) {
+            return is_finite($value)
+                ? $value
+                : null;
         }
 
         if (is_array($value)) {
-            $truncated = [];
+            return $this->sanitizeArrayRecursive(
+                $value,
+                $depth,
+                $visited
+            );
+        }
 
-            foreach ($value as $key => $item) {
-                $truncated[$key] = $this->truncate(
-                    $item,
-                    $maxLength
+        if (
+            is_object($value) &&
+            method_exists(
+                $value,
+                '__toString'
+            )
+        ) {
+            try {
+                return $this->truncate(
+                    (string) $value,
+                    self::MAX_METADATA_STRING_LENGTH
                 );
+            } catch (Throwable) {
+                return '[object]';
             }
+        }
 
-            return $truncated;
+        if (is_object($value)) {
+            return '[object]';
         }
 
         return $value;
     }
 
-    private function send(array $payload): void
-    {
+    private function sanitizeArrayRecursive(
+        array $value,
+        int $depth,
+        array &$visited
+    ): array {
+        if ($depth > self::MAX_SANITIZE_DEPTH) {
+            return [
+                '[truncated]' => true,
+            ];
+        }
+
+        $result = [];
+        $count = 0;
+
+        foreach ($value as $key => $item) {
+            if ($count >= self::MAX_ARRAY_ITEMS) {
+                $result['[truncated_items]'] = true;
+                break;
+            }
+
+            $keyString = (string) $key;
+
+            if ($this->isSensitiveKey($keyString)) {
+                $result[$keyString] =
+                    '[REDACTED]';
+
+                $count++;
+                continue;
+            }
+
+            $result[$keyString] =
+                $this->sanitizeValue(
+                    $item,
+                    $depth + 1,
+                    $visited
+                );
+
+            $count++;
+        }
+
+        return $result;
+    }
+
+    private function isSensitiveKey(
+        string $key
+    ): bool {
+        $normalized = strtolower(
+            preg_replace(
+                '/[^a-z0-9_]/i',
+                '_',
+                $key
+            ) ?? $key
+        );
+
+        foreach (self::SENSITIVE_KEYS as $sensitive) {
+            if (
+                $normalized === $sensitive ||
+                str_contains(
+                    $normalized,
+                    $sensitive
+                )
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function truncate(
+        mixed $value,
+        int $maxLength = 5000
+    ): mixed {
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        if (mb_strlen($value) <= $maxLength) {
+            return $value;
+        }
+
+        return mb_substr(
+            $value,
+            0,
+            $maxLength
+        ) . '... [truncated]';
+    }
+
+    private function send(
+        array $payload
+    ): void {
         if (
             !$this->initialized ||
             empty($this->apiKey) ||
-            $this->apiKey === 'PENDING_API_KEY'
+            $this->apiKey === 'PENDING_API_KEY' ||
+            empty($this->endpoint)
         ) {
             return;
         }
 
+        $payload = $this->sanitizeArray(
+            $payload
+        );
+
         $jsonPayload = json_encode(
             $payload,
-            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+            JSON_UNESCAPED_UNICODE |
+            JSON_UNESCAPED_SLASHES |
+            JSON_INVALID_UTF8_SUBSTITUTE
         );
 
         if ($jsonPayload === false) {
             error_log(
                 '[DevInspector] Falha ao serializar o payload.'
             );
+
             return;
         }
 
-        $ch = curl_init($this->endpoint);
+        $ch = curl_init(
+            $this->endpoint
+        );
 
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $jsonPayload,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'x-api-key: ' . $this->apiKey,
-            ],
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 3,
-            CURLOPT_CONNECTTIMEOUT => 2,
-        ]);
+        if ($ch === false) {
+            return;
+        }
+
+        curl_setopt_array(
+            $ch,
+            [
+                CURLOPT_POST => true,
+
+                CURLOPT_POSTFIELDS =>
+                    $jsonPayload,
+
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/json',
+                    'Accept: application/json',
+                    'x-api-key: ' .
+                        $this->apiKey,
+                ],
+
+                CURLOPT_RETURNTRANSFER => true,
+
+                CURLOPT_TIMEOUT => 3,
+
+                CURLOPT_CONNECTTIMEOUT => 2,
+
+                CURLOPT_FOLLOWLOCATION => false,
+
+                CURLOPT_SSL_VERIFYPEER => true,
+
+                CURLOPT_SSL_VERIFYHOST => 2,
+            ]
+        );
 
         $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
-        if (curl_errno($ch)) {
+        $httpCode = curl_getinfo(
+            $ch,
+            CURLINFO_HTTP_CODE
+        );
+
+        $curlError = curl_error($ch);
+
+        if ($curlError !== '') {
             error_log(
                 '[DevInspector] Falha ao enviar requisição para o painel: ' .
-                curl_error($ch)
+                $curlError
             );
         } elseif ($httpCode >= 400) {
             error_log(
@@ -523,10 +1082,14 @@ class AuditCore
 
     private function getIsoTimestamp(): string
     {
-        return (new DateTime(
-            'now',
-            new DateTimeZone('UTC')
-        ))->format('Y-m-d\TH:i:s.v\Z');
+        return (
+            new DateTime(
+                'now',
+                new DateTimeZone('UTC')
+            )
+        )->format(
+            'Y-m-d\TH:i:s.v\Z'
+        );
     }
 
     private function getCurrentUrl(): string
@@ -535,20 +1098,53 @@ class AuditCore
             isset($_SERVER['HTTP_HOST']) &&
             isset($_SERVER['REQUEST_URI'])
         ) {
-            $protocol = (
-                !empty($_SERVER['HTTPS']) &&
-                $_SERVER['HTTPS'] !== 'off'
-            ) ? 'https' : 'http';
+            $protocol =
+                (
+                    !empty($_SERVER['HTTPS']) &&
+                    $_SERVER['HTTPS'] !== 'off'
+                )
+                    ? 'https'
+                    : 'http';
 
-            return "{$protocol}://{$_SERVER['HTTP_HOST']}{$_SERVER['REQUEST_URI']}";
+            return
+                "{$protocol}://" .
+                $_SERVER['HTTP_HOST'] .
+                $_SERVER['REQUEST_URI'];
         }
 
         return '';
     }
 
-    private static function generateId(string $prefix): string
-    {
-        return $prefix . bin2hex(random_bytes(16));
+    private function normalizePath(
+        string $path
+    ): string {
+        $path = '/' . ltrim(
+            $path,
+            '/'
+        );
+
+        if ($path !== '/') {
+            $path = rtrim(
+                $path,
+                '/'
+            );
+        }
+
+        return $path;
+    }
+
+    private static function generateId(
+        string $prefix
+    ): string {
+        try {
+            return $prefix .
+                bin2hex(
+                    random_bytes(16)
+                );
+        } catch (Throwable) {
+            return $prefix .
+                uniqid('', true);
+        }
     }
 }
 

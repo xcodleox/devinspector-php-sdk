@@ -9,24 +9,74 @@ class AuditServiceProvider extends ServiceProvider
 {
     public function boot(): void
     {
-        // Lê as configurações do .env do projeto do usuário
-        $apiKey = config('services.devinspector.api_key', env('DEVINSPECTOR_API_KEY'));
-        $endpoint = config('services.devinspector.endpoint', env('DEVINSPECTOR_ENDPOINT'));
-        $environment = config('services.devinspector.environment', env('APP_ENV', 'production'));
+        /*
+         * Configurações do projeto Laravel.
+         *
+         * Pode utilizar:
+         *
+         * config/services.php
+         *
+         * ou diretamente as variáveis do .env.
+         */
+        $apiKey = config(
+            'services.devinspector.api_key',
+            env('DEVINSPECTOR_API_KEY')
+        );
 
-        if ($apiKey) {
-            AuditCore::getInstance()->init(
-                apiKey: $apiKey,
-                endpoint: $endpoint,
-                environment: $environment
+        $endpoint = config(
+            'services.devinspector.endpoint',
+            env('DEVINSPECTOR_ENDPOINT')
+        );
+
+        $environment = config(
+            'services.devinspector.environment',
+            env('APP_ENV', 'production')
+        );
+
+        $release = config(
+            'services.devinspector.release',
+            env('DEVINSPECTOR_RELEASE')
+        );
+
+        $slowThresholdMs = config(
+            'services.devinspector.slow_threshold_ms',
+            env('DEVINSPECTOR_SLOW_THRESHOLD_MS')
+        );
+
+        /*
+         * Converte o threshold para float quando
+         * fornecido através do .env/config.
+         */
+        if (
+            $slowThresholdMs !== null &&
+            $slowThresholdMs !== ''
+        ) {
+            $slowThresholdMs = (float) $slowThresholdMs;
+        } else {
+            $slowThresholdMs = null;
+        }
+
+        if (
+            is_string($apiKey) &&
+            trim($apiKey) !== ''
+        ) {
+            AuditCore::getInstance()->initAdvanced(
+                $apiKey,
+                $endpoint,
+                $environment,
+                $release,
+                $slowThresholdMs
             );
         }
     }
 
     public function register(): void
     {
-        $this->app->singleton(AuditCore::class, function () {
-            return AuditCore::getInstance();
-        });
+        $this->app->singleton(
+            AuditCore::class,
+            function () {
+                return AuditCore::getInstance();
+            }
+        );
     }
 }
