@@ -1,612 +1,186 @@
 <?php
 
-namespace DevInspector;
+namespace DevInspector\Audit;
 
+use Exception;
 use Throwable;
 use ErrorException;
-use DateTime;
-use DateTimeZone;
 
-class RequestContext
+#region Models & Data Structures
+
+class AuditUser
 {
-    public int $queriesCount = 0;
-    public float $slowQueries = 0.0;
+    public function __construct(
+        public ?string $id = null,
+        public ?string $email = null,
+        public ?string $username = null,
+        public array $additionalData = []
+    ) {}
 
+    public function toArray(): array
+    {
+        return array_merge([
+            'id' => $this->id,
+            'email' => $this->email,
+            'username' => $this->username,
+        ], $this->additionalData);
+    }
+}
+
+class Breadcrumb
+{
+    public function __construct(
+        public string $type = '',
+        public ?string $message = null,
+        public ?array $metadata = null,
+        public ?string $timestamp = null
+    ) {}
+
+    public function toArray(): array
+    {
+        return [
+            'timestamp' => $this->timestamp,
+            'type' => $this->type,
+            'message' => $this->message,
+            'metadata' => $this->metadata,
+        ];
+    }
+}
+
+class InitOptions
+{
+    public function __construct(
+        public string $apiKey,
+        public ?string $endpoint = null,
+        public ?string $apmEndpoint = null,
+        public ?string $environment = null,
+        public ?string $release = null,
+        public ?int $slowThresholdMs = null,
+        public ?int $requestTimeoutMs = null
+    ) {}
+}
+
+class RequestMetricData
+{
+    public string $method = 'GET';
+    public string $url = '';
+    public int $statusCode = 0;
+    public float $durationMs = 0.0;
+    public ?string $userAgent = null;
+    public ?string $route = null;
+    public ?int $dbQueriesCount = null;
+    public ?float $slowQueryMs = null;
     public ?string $requestId = null;
     public ?string $traceId = null;
     public ?string $spanId = null;
-
-    public string $url = '';
+    public ?array $metadata = null;
 }
+
+class DbQueryData
+{
+    public string $operation = '';
+    public ?string $collection = null;
+    public float $durationMs = 0.0;
+    public ?string $url = null;
+    public ?string $requestId = null;
+    public ?string $traceId = null;
+    public ?string $spanId = null;
+    public ?array $metadata = null;
+}
+
+class CustomMetricData
+{
+    public string $metricName = '';
+    public float $metricValue = 0.0;
+    public ?array $metadata = null;
+    public ?string $requestId = null;
+    public ?string $traceId = null;
+    public ?string $spanId = null;
+}
+
+#endregion
+
+#region Main AuditCore Implementation
 
 class AuditCore
 {
-    private const DEFAULT_ENDPOINT =
-        'https://api.devinspector.com.br/api/ingest/track';
-
+    private const DEFAULT_ENDPOINT = 'https://api.devinspector.com.br/api/ingest/track';
+    private const DEFAULT_APM_ENDPOINT = 'https://api.devinspector.com.br/api/ingest/apm';
     private const MAX_BREADCRUMBS = 50;
-    private const MAX_MESSAGE_LENGTH = 500;
-    private const MAX_STACK_TRACE_LENGTH = 10000;
-    private const MAX_METADATA_STRING_LENGTH = 5000;
-    private const MAX_METRIC_NAME_LENGTH = 200;
-    private const MAX_ARRAY_ITEMS = 100;
-    private const MAX_SANITIZE_DEPTH = 10;
+    private const MAX_QUEUE_SIZE = 100; // Proteção contra OOM em workers
+    private const MAX_STRING_LENGTH = 10000;
+    private const MAX_METADATA_DEPTH = 6;
+    private const DEFAULT_REQUEST_TIMEOUT_MS = 2000; // Reduzido para evitar trava prolongada na shutdown
 
     private const SENSITIVE_KEYS = [
-        'password',
-        'passwd',
-        'pwd',
-        'secret',
-        'token',
-        'access_token',
-        'refresh_token',
-        'api_key',
-        'apikey',
-        'authorization',
-        'cookie',
-        'set_cookie',
-        'credit_card',
-        'card_number',
-        'cvv',
-        'cvc',
-        'ssn',
-        'private_key',
-        'client_secret',
+        'password', 'senha', 'token', 'authorization', 'auth', 'bearer',
+        'credit_card', 'creditcard', 'cartao', 'cvv', 'cpf', 'rg',
+        'secret', 'private_key', 'privatekey'
     ];
-
-    private string $apiKey = 'PENDING_API_KEY';
-
-    private string $endpoint = self::DEFAULT_ENDPOINT;
-
-    private string $environment = 'production';
-
-    private ?string $release = null;
-
-    private float $slowThresholdMs = 300.0;
-
-    public bool $initialized = false;
-
-    private bool $listenersAttached = false;
-
-    private static ?RequestContext $requestContext = null;
 
     private static ?AuditCore $instance = null;
 
-    private ?array $user = null;
+    private string $apiKey = '';
+    private string $endpoint = self::DEFAULT_ENDPOINT;
+    private string $apmEndpoint = self::DEFAULT_APM_ENDPOINT;
+    private string $environment = 'production';
+    private ?string $release = null;
+    private int $slowThresholdMs = 300;
+    private int $requestTimeoutMs = self::DEFAULT_REQUEST_TIMEOUT_MS;
+    private ?AuditUser $user = null;
+    private bool $initialized = false;
+    private bool $listenersAttached = false;
 
+    /** @var Breadcrumb[] */
     private array $breadcrumbs = [];
 
-    private function __construct()
-    {
-    }
+    /** @var array<array{endpoint: string, payload: array}> */
+    private array $queue = [];
 
     public static function getInstance(): AuditCore
     {
         if (self::$instance === null) {
             self::$instance = new self();
         }
-
         return self::$instance;
     }
 
-    public static function beginRequest(
-        ?string $requestId = null,
-        ?string $traceId = null,
-        ?string $spanId = null,
-        string $url = ''
-    ): void {
-        self::$requestContext = new RequestContext();
-
-        self::$requestContext->requestId = !empty($requestId)
-            ? $requestId
-            : self::generateId('req_');
-
-        self::$requestContext->traceId = !empty($traceId)
-            ? $traceId
-            : self::generateId('trace_');
-
-        self::$requestContext->spanId = !empty($spanId)
-            ? $spanId
-            : self::generateId('span_');
-
-        self::$requestContext->url = $url;
-    }
-
-    public static function getRequestContext(): ?RequestContext
+    public function init(InitOptions $options): void
     {
-        return self::$requestContext;
-    }
-
-    public static function clearRequest(): void
-    {
-        self::$requestContext = null;
-    }
-
-    public function init(
-        string $apiKey,
-        ?string $endpoint = null,
-        ?string $environment = null
-    ): void {
-        $this->initAdvanced(
-            $apiKey,
-            $endpoint,
-            $environment,
-            null,
-            null
-        );
-    }
-
-    public function initAdvanced(
-        string $apiKey,
-        ?string $endpoint = null,
-        ?string $environment = null,
-        ?string $release = null,
-        ?float $slowThresholdMs = null
-    ): void {
-        if (empty(trim($apiKey))) {
-            error_log(
-                '[AuditSDK] API Key não fornecida no init().'
-            );
-
-            return;
+        if (empty(trim($options->apiKey))) {
+            throw new \InvalidArgumentException('DevInspector: apiKey é obrigatório.');
         }
 
-        $this->apiKey = trim($apiKey);
-
-        if (!empty($endpoint)) {
-            $this->endpoint = rtrim(trim($endpoint), '/');
-        }
-
-        if (!empty($environment)) {
-            $this->environment = trim($environment);
-        }
-
-        if ($release !== null && trim($release) !== '') {
-            $this->release = trim($release);
-        }
-
-        if (
-            $slowThresholdMs !== null &&
-            is_finite($slowThresholdMs) &&
-            $slowThresholdMs >= 0
-        ) {
-            $this->slowThresholdMs = $slowThresholdMs;
-        }
+        $this->apiKey = trim($options->apiKey);
+        $this->endpoint = trim($options->endpoint ?? self::DEFAULT_ENDPOINT);
+        $this->apmEndpoint = trim($options->apmEndpoint ?? self::DEFAULT_APM_ENDPOINT);
+        $this->environment = trim($options->environment ?? 'production');
+        $this->release = trim($options->release ?? '');
+        $this->slowThresholdMs = max(0, $options->slowThresholdMs ?? 300);
+        $this->requestTimeoutMs = max(100, $options->requestTimeoutMs ?? self::DEFAULT_REQUEST_TIMEOUT_MS);
 
         $this->initialized = true;
 
-        $this->listenGlobalErrors();
+        $this->attachGlobalListeners();
     }
 
-    public function getEnvironment(): string
+    #region Getters & User Management
+
+    public function getApiKey(): string { return $this->apiKey; }
+    public function getEndpoint(): string { return $this->endpoint; }
+    public function getApmEndpoint(): string { return $this->apmEndpoint; }
+    public function getEnvironment(): string { return $this->environment; }
+    public function getRelease(): ?string { return $this->release; }
+    public function getSlowThresholdMs(): int { return $this->slowThresholdMs; }
+    public function getRequestTimeoutMs(): int { return $this->requestTimeoutMs; }
+    public function isInitialized(): bool { return $this->initialized; }
+
+    public function setUser(?AuditUser $user): void
     {
-        return $this->environment;
+        $this->user = $user !== null ? $this->sanitizeData($user) : null;
     }
 
-    public function getRelease(): ?string
-    {
-        return $this->release;
-    }
-
-    public function getSlowThresholdMs(): float
-    {
-        return $this->slowThresholdMs;
-    }
-
-    public function isIngestUrl(string $targetUrl): bool
-    {
-        $targetUrl = trim($targetUrl);
-
-        if ($targetUrl === '') {
-            return false;
-        }
-
-        try {
-            $targetUri = parse_url($targetUrl);
-            $endpointUri = parse_url($this->endpoint);
-
-            if (
-                $targetUri === false ||
-                $endpointUri === false
-            ) {
-                return false;
-            }
-
-            $targetHost = strtolower(
-                $targetUri['host'] ?? ''
-            );
-
-            $endpointHost = strtolower(
-                $endpointUri['host'] ?? ''
-            );
-
-            $targetPath = $this->normalizePath(
-                $targetUri['path'] ?? ''
-            );
-
-            $endpointPath = $this->normalizePath(
-                $endpointUri['path'] ?? ''
-            );
-
-            if (
-                $targetHost === '' ||
-                $endpointHost === ''
-            ) {
-                return false;
-            }
-
-            return
-                $targetHost === $endpointHost &&
-                $targetPath === $endpointPath;
-        } catch (Throwable) {
-            return false;
-        }
-    }
-
-    public function captureRequest(
-        string $method,
-        string $url,
-        int $statusCode,
-        float $durationMs,
-        string $userAgent = '',
-        ?string $route = null,
-        int $dbQueriesCount = 0,
-        float $slowQueryMs = 0.0,
-        ?string $requestId = null,
-        ?string $traceId = null,
-        ?string $spanId = null,
-        array $metadata = []
-    ): void {
-        if (
-            !$this->initialized ||
-            trim($url) === '' ||
-            trim($method) === ''
-        ) {
-            return;
-        }
-
-        if ($this->isIngestUrl($url)) {
-            return;
-        }
-
-        $context = self::$requestContext;
-
-        $requestId ??= $context?->requestId;
-        $traceId ??= $context?->traceId;
-        $spanId ??= $context?->spanId;
-
-        $method = strtoupper(trim($method));
-
-        $meta = array_merge(
-            $metadata,
-            [
-                'environment' => $this->environment,
-                'timestamp' => $this->getIsoTimestamp(),
-                'route' => !empty($route)
-                    ? $route
-                    : $url,
-                'dbQueriesCount' => max(0, $dbQueriesCount),
-                'slowQueryMs' => round(
-                    max(0.0, $slowQueryMs),
-                    2
-                ),
-            ]
-        );
-
-        $payload = $this->createBasePayload(
-            'request_metric'
-        );
-
-        $payload['message'] =
-            "{$method} {$url} - {$statusCode}";
-
-        $payload['method'] = $method;
-        $payload['url'] = $url;
-        $payload['statusCode'] = $statusCode;
-        $payload['durationMs'] = round(
-            max(0.0, $durationMs),
-            2
-        );
-        $payload['browser'] = $userAgent;
-
-        $this->addCorrelationIds(
-            $payload,
-            $requestId,
-            $traceId,
-            $spanId
-        );
-
-        $payload['metadata'] = $meta;
-
-        $this->send($payload);
-    }
-
-    public function captureDbQuery(
-        string $operation,
-        ?string $collection,
-        float $durationMs,
-        ?string $url = null,
-        ?string $requestId = null,
-        ?string $traceId = null,
-        ?string $spanId = null,
-        array $metadata = []
-    ): void {
-        if (!$this->initialized) {
-            return;
-        }
-
-        $context = self::$requestContext;
-
-        $requestId ??= $context?->requestId;
-        $traceId ??= $context?->traceId;
-        $spanId ??= $context?->spanId;
-
-        $url ??= $context?->url ?? '';
-
-        $operation = trim($operation);
-
-        if ($operation === '') {
-            $operation = 'unknown';
-        }
-
-        $durationMs = max(0.0, $durationMs);
-
-        $meta = array_merge(
-            $metadata,
-            [
-                'collection' => $collection ?? '',
-                'operation' => $operation,
-                'durationMs' => round(
-                    $durationMs,
-                    2
-                ),
-                'environment' => $this->environment,
-                'timestamp' => $this->getIsoTimestamp(),
-            ]
-        );
-
-        $payload = $this->createBasePayload(
-            'db_query'
-        );
-
-        $payload['message'] =
-            "DB {$operation}";
-
-        $payload['url'] = $url;
-        $payload['durationMs'] = round(
-            $durationMs,
-            2
-        );
-
-        $this->addCorrelationIds(
-            $payload,
-            $requestId,
-            $traceId,
-            $spanId
-        );
-
-        $payload['metadata'] = $meta;
-
-        $this->send($payload);
-    }
-
-    public function captureError(
-        Throwable $error,
-        array $metadata = []
-    ): void {
-        if (!$this->initialized) {
-            return;
-        }
-
-        $context = self::$requestContext;
-
-        $rawMessage = trim(
-            $error->getMessage()
-        );
-
-        if ($rawMessage === '') {
-            $rawMessage = 'Erro Desconhecido';
-        }
-
-        $rawStack = $error->getTraceAsString();
-
-        $meta = array_merge(
-            $metadata,
-            [
-                'environment' => $this->environment,
-                'timestamp' => $this->getIsoTimestamp(),
-                'hResult' => $error->getCode(),
-                'exceptionType' => get_class($error),
-            ]
-        );
-
-        $payload = $this->createBasePayload(
-            'error'
-        );
-
-        $payload['message'] = $this->truncate(
-            $rawMessage,
-            self::MAX_MESSAGE_LENGTH
-        );
-
-        $payload['stackTrace'] = $this->truncate(
-            $rawStack,
-            self::MAX_STACK_TRACE_LENGTH
-        );
-
-        $payload['url'] =
-            $context?->url
-            ?: $this->getCurrentUrl();
-
-        $payload['browser'] =
-            'PHP/' . PHP_VERSION;
-
-        $this->addCorrelationIds(
-            $payload,
-            $context?->requestId,
-            $context?->traceId,
-            $context?->spanId
-        );
-
-        $payload['metadata'] = $meta;
-
-        $this->send($payload);
-    }
-
-    public function captureException(
-        Throwable $error,
-        array $metadata = []
-    ): void {
-        $this->captureError(
-            $error,
-            $metadata
-        );
-    }
-
-    public function captureMessage(
-        string $message,
-        array $metadata = []
-    ): void {
-        if (!$this->initialized) {
-            return;
-        }
-
-        $context = self::$requestContext;
-
-        $meta = array_merge(
-            [
-                'level' => 'info',
-            ],
-            $metadata,
-            [
-                'environment' => $this->environment,
-                'timestamp' => $this->getIsoTimestamp(),
-            ]
-        );
-
-        $payload = $this->createBasePayload(
-            'message'
-        );
-
-        $payload['message'] = $this->truncate(
-            $message,
-            self::MAX_MESSAGE_LENGTH
-        );
-
-        $payload['stackTrace'] = '';
-
-        $payload['url'] =
-            $context?->url
-            ?: $this->getCurrentUrl();
-
-        $payload['browser'] =
-            'PHP/' . PHP_VERSION;
-
-        $this->addCorrelationIds(
-            $payload,
-            $context?->requestId,
-            $context?->traceId,
-            $context?->spanId
-        );
-
-        $payload['metadata'] = $meta;
-
-        $this->send($payload);
-    }
-
-    public function captureMetric(
-        string $metricName,
-        float $metricValue,
-        array $metadata = [],
-        ?string $requestId = null,
-        ?string $traceId = null,
-        ?string $spanId = null
-    ): void {
-        $this->captureCustomMetric(
-            $metricName,
-            $metricValue,
-            $metadata,
-            $requestId,
-            $traceId,
-            $spanId
-        );
-    }
-
-    public function captureCustomMetric(
-        string $metricName,
-        float $metricValue,
-        array $metadata = [],
-        ?string $requestId = null,
-        ?string $traceId = null,
-        ?string $spanId = null
-    ): void {
-        if (!$this->initialized) {
-            return;
-        }
-
-        $metricName = trim($metricName);
-
-        if ($metricName === '') {
-            return;
-        }
-
-        if (
-            !is_finite($metricValue) ||
-            is_nan($metricValue)
-        ) {
-            return;
-        }
-
-        $metricName = $this->truncate(
-            $metricName,
-            self::MAX_METRIC_NAME_LENGTH
-        );
-
-        $context = self::$requestContext;
-
-        $requestId ??= $context?->requestId;
-        $traceId ??= $context?->traceId;
-        $spanId ??= $context?->spanId;
-
-        $meta = array_merge(
-            $metadata,
-            [
-                'environment' => $this->environment,
-                'timestamp' => $this->getIsoTimestamp(),
-            ]
-        );
-
-        $payload = $this->createBasePayload(
-            'custom_metric'
-        );
-
-        $payload['message'] =
-            "Custom metric: {$metricName}";
-
-        $payload['metricName'] = $metricName;
-        $payload['metricValue'] = $metricValue;
-
-        $this->addCorrelationIds(
-            $payload,
-            $requestId,
-            $traceId,
-            $spanId
-        );
-
-        $payload['metadata'] = $meta;
-
-        $this->send($payload);
-    }
-
-    public function setUser(
-        array $user
-    ): void {
-        $this->user = $this->sanitizeArray(
-            $user
-        );
-    }
-
-    public function getUser(): ?array
+    public function getUser(): ?AuditUser
     {
         return $this->user;
     }
@@ -616,44 +190,34 @@ class AuditCore
         $this->user = null;
     }
 
-    public function addBreadcrumb(
-        string $type,
-        string $message = '',
-        array $metadata = []
-    ): void {
-        $breadcrumb = [
-            'timestamp' => $this->getIsoTimestamp(),
-            'type' => trim($type),
-            'message' => $this->truncate(
-                $message,
-                self::MAX_MESSAGE_LENGTH
-            ),
-        ];
+    #endregion
 
-        if (!empty($metadata)) {
-            $breadcrumb['metadata'] =
-                $this->sanitizeArray(
-                    $metadata
-                );
-        }
+    #region Breadcrumbs & Context
 
-        $this->breadcrumbs[] =
-            $breadcrumb;
+    public function addBreadcrumb(Breadcrumb $breadcrumb): void
+    {
+        if (empty(trim($breadcrumb->type))) return;
 
-        if (
-            count($this->breadcrumbs) >
-            self::MAX_BREADCRUMBS
-        ) {
-            $this->breadcrumbs = array_slice(
-                $this->breadcrumbs,
-                -self::MAX_BREADCRUMBS
-            );
+        $type = mb_substr(trim($breadcrumb->type), 0, 200);
+        $message = $breadcrumb->message !== null ? mb_substr($breadcrumb->message, 0, self::MAX_STRING_LENGTH) : null;
+
+        $item = new Breadcrumb(
+            $type,
+            $message,
+            $breadcrumb->metadata !== null ? $this->sanitizeData($breadcrumb->metadata) : null,
+            $breadcrumb->timestamp ?: $this->getCurrentTimestamp()
+        );
+
+        $this->breadcrumbs[] = $item;
+
+        if (count($this->breadcrumbs) > self::MAX_BREADCRUMBS) {
+            array_shift($this->breadcrumbs);
         }
     }
 
     public function getBreadcrumbs(): array
     {
-        return $this->breadcrumbs;
+        return array_map(fn($b) => $this->cloneForQueue($b), $this->breadcrumbs);
     }
 
     public function clearBreadcrumbs(): void
@@ -661,494 +225,495 @@ class AuditCore
         $this->breadcrumbs = [];
     }
 
-    public function traceOperation(
-        string $operationName,
-        float $thresholdMs,
-        callable $operation
-    ): mixed {
-        $context = self::$requestContext;
-
-        if ($context !== null) {
-            $context->queriesCount++;
-        }
-
-        $start = microtime(true);
-
-        try {
-            $result = $operation();
-
-            $durationMs =
-                (microtime(true) - $start) * 1000;
-
-            if (
-                $durationMs >=
-                max(0.0, $thresholdMs)
-            ) {
-                if ($context !== null) {
-                    $context->slowQueries +=
-                        $durationMs;
-                }
-
-                $this->captureDbQuery(
-                    $operationName,
-                    null,
-                    $durationMs,
-                    $context?->url,
-                    $context?->requestId,
-                    $context?->traceId,
-                    $context?->spanId
-                );
-            }
-
-            return $result;
-        } catch (Throwable $e) {
-            $durationMs =
-                (microtime(true) - $start) * 1000;
-
-            $this->captureException(
-                $e,
-                [
-                    'operationName' =>
-                        $operationName,
-                    'durationMs' =>
-                        round($durationMs, 2),
-                ]
-            );
-
-            throw $e;
-        }
-    }
-
-    public function traceOperationWithDefaultThreshold(
-        string $operationName,
-        callable $operation
-    ): mixed {
-        return $this->traceOperation(
-            $operationName,
-            $this->slowThresholdMs,
-            $operation
-        );
-    }
-
-    private function listenGlobalErrors(): void
+    public function getContext(): array
     {
-        if ($this->listenersAttached) {
-            return;
-        }
-
-        $this->listenersAttached = true;
-
-        set_exception_handler(
-            function (Throwable $exception): void {
-                $this->captureError(
-                    $exception,
-                    [
-                        'type' =>
-                            'uncaught_exception',
-                    ]
-                );
-            }
-        );
-
-        set_error_handler(
-            function (
-                int $severity,
-                string $message,
-                string $file,
-                int $line
-            ): bool {
-                if (!(error_reporting() & $severity)) {
-                    return false;
-                }
-
-                $meta = [
-                    'type' => 'php_error',
-                    'file' => $file,
-                    'line' => $line,
-                ];
-
-                $this->captureError(
-                    new ErrorException(
-                        $message,
-                        0,
-                        $severity,
-                        $file,
-                        $line
-                    ),
-                    $meta
-                );
-
-                return false;
-            }
-        );
-    }
-
-    private function createBasePayload(
-        string $type
-    ): array {
-        $payload = [
-            'type' => $type,
+        return [
             'environment' => $this->environment,
             'release' => $this->release,
+            'user' => $this->cloneForQueue($this->getUser()),
+            'breadcrumbs' => $this->getBreadcrumbs()
+        ];
+    }
+
+    public function isIngestUrl(string $url): bool
+    {
+        if (empty(trim($url))) return false;
+
+        try {
+            return (str_starts_with($url, $this->endpoint) || str_starts_with($url, $this->apmEndpoint));
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    #endregion
+
+    #region ID Generation
+
+    public function createRequestId(): string { return $this->createId('req'); }
+    public function createTraceId(): string { return $this->createId('trace'); }
+    public function createSpanId(): string { return $this->createId('span'); }
+
+    private function createId(string $prefix): string
+    {
+        $data = random_bytes(16);
+        $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
+        $data[8] = chr(ord($data[8]) & 0x3f | 0x80);
+        return sprintf('%s-%s', $prefix, vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4)));
+    }
+
+    #endregion
+
+    #region Captures
+
+    public function captureRequest(RequestMetricData $data): void
+    {
+        $url = trim($data->url);
+        if (empty($url)) return;
+
+        $metadata = $data->metadata ?? [];
+        if ($data->route !== null) $metadata['route'] = $data->route;
+        if ($data->dbQueriesCount !== null) $metadata['dbQueriesCount'] = $data->dbQueriesCount;
+        if ($data->slowQueryMs !== null) $metadata['slowQueryMs'] = $data->slowQueryMs;
+        $metadata['timestamp'] = $this->getCurrentTimestamp();
+
+        $this->sendApm([
+            'type' => 'request_metric',
+            'method' => $this->normalizeMethod($data->method) ?? 'GET',
+            'url' => $url,
+            'statusCode' => $this->normalizeStatusCode($data->statusCode) ?? 0,
+            'durationMs' => $this->normalizeDuration($data->durationMs) ?? 0,
+            'browser' => $data->userAgent,
+            'requestId' => $data->requestId,
+            'traceId' => $data->traceId,
+            'spanId' => $data->spanId,
+            'environment' => $this->environment,
+            'release' => $this->release,
+            'user' => $this->cloneForQueue($this->getUser()),
+            'breadcrumbs' => $this->getBreadcrumbs(),
+            'metadata' => $this->cloneForQueue($metadata)
+        ]);
+    }
+
+    public function captureDbQuery(DbQueryData $data): void
+    {
+        $operation = trim($data->operation);
+        if (empty($operation)) return;
+
+        $durationMs = $this->normalizeDuration($data->durationMs) ?? 0;
+        $metadata = array_merge($data->metadata ?? [], [
+            'operation' => $operation,
+            'collection' => $data->collection ?? 'Unknown',
+            'durationMs' => $durationMs,
+            'timestamp' => $this->getCurrentTimestamp()
+        ]);
+
+        $this->sendApm([
+            'type' => 'db_query',
+            'message' => "Database operation: {$operation}",
+            'url' => $data->url,
+            'method' => 'DB',
+            'durationMs' => $durationMs,
+            'requestId' => $data->requestId,
+            'traceId' => $data->traceId,
+            'spanId' => $data->spanId,
+            'environment' => $this->environment,
+            'release' => $this->release,
+            'user' => $this->cloneForQueue($this->getUser()),
+            'breadcrumbs' => $this->getBreadcrumbs(),
+            'metadata' => $this->cloneForQueue($metadata)
+        ]);
+    }
+
+    public function captureMetric(string $metricName, float $metricValue, ?array $metadata = null, ?array $contextIds = null): void
+    {
+        $normalizedName = $this->normalizeMetricName($metricName);
+        if (empty($normalizedName) || is_nan($metricValue) || is_infinite($metricValue)) return;
+
+        $meta = array_merge($metadata ?? [], ['timestamp' => $this->getCurrentTimestamp()]);
+
+        $this->sendApm([
+            'type' => 'custom_metric',
+            'metricName' => $normalizedName,
+            'metricValue' => $metricValue,
+            'requestId' => $contextIds['requestId'] ?? null,
+            'traceId' => $contextIds['traceId'] ?? null,
+            'spanId' => $contextIds['spanId'] ?? null,
+            'environment' => $this->environment,
+            'release' => $this->release,
+            'user' => $this->cloneForQueue($this->getUser()),
+            'breadcrumbs' => $this->getBreadcrumbs(),
+            'metadata' => $this->cloneForQueue($meta)
+        ]);
+    }
+
+    public function captureCustomMetric(CustomMetricData $data): void
+    {
+        $this->captureMetric($data->metricName, $data->metricValue, $data->metadata, [
+            'requestId' => $data->requestId,
+            'traceId' => $data->traceId,
+            'spanId' => $data->spanId
+        ]);
+    }
+
+    public function captureError(Throwable $error, ?array $metadata = null): void
+    {
+        $context = $metadata ?? [];
+        $method = $this->normalizeMethod($context['method'] ?? null);
+        $statusCode = $this->normalizeStatusCode($context['statusCode'] ?? $context['status'] ?? null);
+        $url = isset($context['url']) ? trim((string)$context['url']) : null;
+
+        unset($context['method'], $context['statusCode'], $context['status'], $context['requestId'], $context['traceId'], $context['spanId'], $context['durationMs']);
+        $context['timestamp'] = $this->getCurrentTimestamp();
+
+        $payload = [
+            'type' => 'error',
+            'message' => !empty($error->getMessage()) ? trim($error->getMessage()) : 'Erro desconhecido',
+            'stackTrace' => $error->getTraceAsString(),
+            'environment' => $this->environment,
+            'release' => $this->release,
+            'user' => $this->cloneForQueue($this->getUser()),
+            'breadcrumbs' => $this->getBreadcrumbs(),
+            'metadata' => $this->cloneForQueue($context)
         ];
 
-        if ($this->user !== null) {
-            $payload['user'] =
-                $this->user;
-        }
+        if ($url !== null) $payload['url'] = $url;
+        if ($method !== null) $payload['method'] = $method;
+        if ($statusCode !== null) $payload['statusCode'] = $statusCode;
 
-        if (!empty($this->breadcrumbs)) {
-            $payload['breadcrumbs'] =
-                $this->breadcrumbs;
-        }
-
-        return $payload;
+        $this->sendError($payload);
     }
 
-    private function addCorrelationIds(
-        array &$payload,
-        ?string $requestId,
-        ?string $traceId,
-        ?string $spanId
-    ): void {
-        if (!empty($requestId)) {
-            $payload['requestId'] =
-                $requestId;
-        }
-
-        if (!empty($traceId)) {
-            $payload['traceId'] =
-                $traceId;
-        }
-
-        if (!empty($spanId)) {
-            $payload['spanId'] =
-                $spanId;
-        }
+    public function captureException(mixed $error, ?array $metadata = null): void
+    {
+        $ex = ($error instanceof Throwable) ? $error : new Exception($this->errorToMessage($error));
+        $this->captureError($ex, $metadata);
     }
 
-    private function sanitizeArray(
-        array $value
-    ): array {
-        $visited = [];
+    public function captureMessage(string $message, ?array $metadata = null): void
+    {
+        $normalizedMessage = trim($message);
+        if (empty($normalizedMessage)) return;
 
-        return $this->sanitizeValue(
-            $value,
-            0,
-            $visited
-        );
+        $meta = array_merge($metadata ?? [], ['timestamp' => $this->getCurrentTimestamp()]);
+
+        $this->sendApm([
+            'type' => 'message',
+            'message' => mb_substr($normalizedMessage, 0, self::MAX_STRING_LENGTH),
+            'environment' => $this->environment,
+            'release' => $this->release,
+            'user' => $this->cloneForQueue($this->getUser()),
+            'breadcrumbs' => $this->getBreadcrumbs(),
+            'metadata' => $this->cloneForQueue($meta)
+        ]);
     }
 
-    private function sanitizeValue(
-        mixed $value,
-        int $depth,
-        array &$visited
-    ): mixed {
-        if ($depth > self::MAX_SANITIZE_DEPTH) {
-            return '[truncated]';
+    #endregion
+
+    #region Queue Processing & Send
+
+    /**
+     * Utiliza curl_multi para enviar a fila inteira de forma concorrente,
+     * evitando travar o servidor durante o encerramento da request.
+     */
+    public function flush(): void
+    {
+        if (empty($this->queue)) return;
+
+        $items = $this->queue;
+        $this->queue = [];
+
+        $multiHandle = curl_multi_init();
+        $curlHandles = [];
+
+        foreach ($items as $index => $item) {
+            if (empty($item['endpoint'])) continue;
+
+            $json = json_encode($this->sanitizeData($item['payload']), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            
+            $ch = curl_init($item['endpoint']);
+            curl_setopt_array($ch, [
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $json,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT_MS => $this->requestTimeoutMs,
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/json',
+                    'x-api-key: ' . $this->apiKey,
+                    'Connection: close' // Impede Keep-Alive mantendo conexões presas no FPM
+                ]
+            ]);
+
+            curl_multi_add_handle($multiHandle, $ch);
+            $curlHandles[] = $ch;
         }
 
-        if (is_string($value)) {
-            return $this->truncate(
-                $value,
-                self::MAX_METADATA_STRING_LENGTH
-            );
-        }
-
-        if (
-            is_int($value) ||
-            is_bool($value) ||
-            $value === null
-        ) {
-            return $value;
-        }
-
-        if (is_float($value)) {
-            return is_finite($value)
-                ? $value
-                : null;
-        }
-
-        if (is_array($value)) {
-            return $this->sanitizeArrayRecursive(
-                $value,
-                $depth,
-                $visited
-            );
-        }
-
-        if (
-            is_object($value) &&
-            method_exists(
-                $value,
-                '__toString'
-            )
-        ) {
-            try {
-                return $this->truncate(
-                    (string) $value,
-                    self::MAX_METADATA_STRING_LENGTH
-                );
-            } catch (Throwable) {
-                return '[object]';
+        $active = null;
+        do {
+            $status = curl_multi_exec($multiHandle, $active);
+            if ($active) {
+                curl_multi_select($multiHandle);
             }
-        }
+        } while ($active && $status == CURLM_OK);
 
-        if (is_object($value)) {
-            return '[object]';
+        foreach ($curlHandles as $ch) {
+            curl_multi_remove_handle($multiHandle, $ch);
+            curl_close($ch);
         }
-
-        return $value;
+        
+        curl_multi_close($multiHandle);
     }
 
-    private function sanitizeArrayRecursive(
-        array $value,
-        int $depth,
-        array &$visited
-    ): array {
-        if ($depth > self::MAX_SANITIZE_DEPTH) {
-            return [
-                '[truncated]' => true,
-            ];
+    private function sendError(array $payload): void { $this->enqueue($this->endpoint, $payload); }
+    private function sendApm(array $payload): void { $this->enqueue($this->apmEndpoint, $payload); }
+
+    private function enqueue(string $endpoint, array $payload): void
+    {
+        if (!$this->initialized || empty($this->apiKey)) return;
+
+        if (count($this->queue) >= self::MAX_QUEUE_SIZE) {
+            $this->flush(); // Força o envio se a fila encher durante uma rotina longa
         }
 
-        $result = [];
-        $count = 0;
-
-        foreach ($value as $key => $item) {
-            if ($count >= self::MAX_ARRAY_ITEMS) {
-                $result['[truncated_items]'] = true;
-                break;
-            }
-
-            $keyString = (string) $key;
-
-            if ($this->isSensitiveKey($keyString)) {
-                $result[$keyString] =
-                    '[REDACTED]';
-
-                $count++;
-                continue;
-            }
-
-            $result[$keyString] =
-                $this->sanitizeValue(
-                    $item,
-                    $depth + 1,
-                    $visited
-                );
-
-            $count++;
-        }
-
-        return $result;
+        $this->queue[] = [
+            'endpoint' => $endpoint,
+            'payload' => $this->cloneForQueue($payload)
+        ];
     }
 
-    private function isSensitiveKey(
-        string $key
-    ): bool {
-        $normalized = strtolower(
-            preg_replace(
-                '/[^a-z0-9_]/i',
-                '_',
-                $key
-            ) ?? $key
-        );
+    private function attachGlobalListeners(): void
+    {
+        if ($this->listenersAttached) return;
+        $this->listenersAttached = true;
 
+        set_exception_handler(function (Throwable $ex) {
+            $this->captureError($ex, ['platform' => 'php', 'fatal' => true]);
+            $this->flush();
+        });
+
+        set_error_handler(function (int $errno, string $errstr, string $errfile, int $errline) {
+            if (!(error_reporting() & $errno)) return false;
+            
+            $ex = new ErrorException($errstr, 0, $errno, $errfile, $errline);
+            $this->captureError($ex, ['platform' => 'php', 'fatal' => false]);
+            return true;
+        });
+
+        register_shutdown_function(function () {
+            $error = error_get_last();
+            if ($error !== null && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
+                $ex = new ErrorException($error['message'], 0, $error['type'], $error['file'], $error['line']);
+                $this->captureError($ex, ['platform' => 'php', 'fatal' => true]);
+            }
+            $this->flush();
+        });
+    }
+
+    #endregion
+
+    #region Helpers & Sanitization
+
+    private function getCurrentTimestamp(): string
+    {
+        return (new \DateTime('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.v\Z');
+    }
+
+    private function isSensitiveKey(string $key): bool
+    {
+        $normalized = preg_replace('/[\s-]/', '_', mb_strtolower($key));
         foreach (self::SENSITIVE_KEYS as $sensitive) {
-            if (
-                $normalized === $sensitive ||
-                str_contains(
-                    $normalized,
-                    $sensitive
-                )
-            ) {
+            if (str_contains($normalized, $sensitive)) {
                 return true;
             }
         }
-
         return false;
     }
 
-    private function truncate(
-        mixed $value,
-        int $maxLength = 5000
-    ): mixed {
-        if (!is_string($value)) {
+    private function sanitizeData(mixed $value, int $depth = 0, array &$seen = []): mixed
+    {
+        if ($value === null || is_scalar($value)) {
+            if (is_string($value) && mb_strlen($value) > self::MAX_STRING_LENGTH) {
+                return mb_substr($value, 0, self::MAX_STRING_LENGTH) . '...[truncated]';
+            }
             return $value;
         }
 
-        if (mb_strlen($value) <= $maxLength) {
-            return $value;
+        if ($depth >= self::MAX_METADATA_DEPTH) return '[MaxDepth]';
+
+        if (is_object($value)) {
+            $oid = spl_object_hash($value);
+            if (isset($seen[$oid])) return '[Circular]';
+            $seen[$oid] = true;
+
+            $value = method_exists($value, 'toArray') ? $value->toArray() : get_object_vars($value);
         }
 
-        return mb_substr(
-            $value,
-            0,
-            $maxLength
-        ) . '... [truncated]';
+        if (is_array($value)) {
+            $result = [];
+            $count = 0;
+            foreach ($value as $key => $val) {
+                if ($count++ >= 100) break;
+                
+                if ($this->isSensitiveKey((string)$key)) {
+                    $result[$key] = '[REDACTED]';
+                } else {
+                    $result[$key] = $this->sanitizeData($val, $depth + 1, $seen);
+                }
+            }
+            return $result;
+        }
+
+        return null;
     }
 
-    private function send(
-        array $payload
-    ): void {
-        if (
-            !$this->initialized ||
-            empty($this->apiKey) ||
-            $this->apiKey === 'PENDING_API_KEY' ||
-            empty($this->endpoint)
-        ) {
-            return;
-        }
-
-        $payload = $this->sanitizeArray(
-            $payload
-        );
-
-        $jsonPayload = json_encode(
-            $payload,
-            JSON_UNESCAPED_UNICODE |
-            JSON_UNESCAPED_SLASHES |
-            JSON_INVALID_UTF8_SUBSTITUTE
-        );
-
-        if ($jsonPayload === false) {
-            error_log(
-                '[DevInspector] Falha ao serializar o payload.'
-            );
-
-            return;
-        }
-
-        $ch = curl_init(
-            $this->endpoint
-        );
-
-        if ($ch === false) {
-            return;
-        }
-
-        curl_setopt_array(
-            $ch,
-            [
-                CURLOPT_POST => true,
-
-                CURLOPT_POSTFIELDS =>
-                    $jsonPayload,
-
-                CURLOPT_HTTPHEADER => [
-                    'Content-Type: application/json',
-                    'Accept: application/json',
-                    'x-api-key: ' .
-                        $this->apiKey,
-                ],
-
-                CURLOPT_RETURNTRANSFER => true,
-
-                CURLOPT_TIMEOUT => 3,
-
-                CURLOPT_CONNECTTIMEOUT => 2,
-
-                CURLOPT_FOLLOWLOCATION => false,
-
-                CURLOPT_SSL_VERIFYPEER => true,
-
-                CURLOPT_SSL_VERIFYHOST => 2,
-            ]
-        );
-
-        $response = curl_exec($ch);
-
-        $httpCode = curl_getinfo(
-            $ch,
-            CURLINFO_HTTP_CODE
-        );
-
-        $curlError = curl_error($ch);
-
-        if ($curlError !== '') {
-            error_log(
-                '[DevInspector] Falha ao enviar requisição para o painel: ' .
-                $curlError
-            );
-        } elseif ($httpCode >= 400) {
-            error_log(
-                "[DevInspector] Erro na API ({$httpCode}): {$response}"
-            );
-        }
-
-        curl_close($ch);
-    }
-
-    private function getIsoTimestamp(): string
+    private function cloneForQueue(mixed $value): mixed
     {
-        return (
-            new DateTime(
-                'now',
-                new DateTimeZone('UTC')
-            )
-        )->format(
-            'Y-m-d\TH:i:s.v\Z'
-        );
+        return $this->sanitizeData($value);
     }
 
-    private function getCurrentUrl(): string
+    private function errorToMessage(mixed $error): string
     {
-        if (
-            isset($_SERVER['HTTP_HOST']) &&
-            isset($_SERVER['REQUEST_URI'])
-        ) {
-            $protocol =
-                (
-                    !empty($_SERVER['HTTPS']) &&
-                    $_SERVER['HTTPS'] !== 'off'
-                )
-                    ? 'https'
-                    : 'http';
+        if ($error instanceof Throwable) return !empty($error->getMessage()) ? $error->getMessage() : 'Erro desconhecido';
+        if (is_string($error)) return !empty($error) ? $error : 'Erro desconhecido';
 
-            return
-                "{$protocol}://" .
-                $_SERVER['HTTP_HOST'] .
-                $_SERVER['REQUEST_URI'];
-        }
-
-        return '';
-    }
-
-    private function normalizePath(
-        string $path
-    ): string {
-        $path = '/' . ltrim(
-            $path,
-            '/'
-        );
-
-        if ($path !== '/') {
-            $path = rtrim(
-                $path,
-                '/'
-            );
-        }
-
-        return $path;
-    }
-
-    private static function generateId(
-        string $prefix
-    ): string {
         try {
-            return $prefix .
-                bin2hex(
-                    random_bytes(16)
-                );
+            return json_encode($this->sanitizeData($error), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         } catch (Throwable) {
-            return $prefix .
-                uniqid('', true);
+            return 'Erro desconhecido';
         }
     }
+
+    private function normalizeMethod(mixed $method): ?string
+    {
+        $val = mb_strtoupper(trim((string)$method));
+        return empty($val) ? null : $val;
+    }
+
+    private function normalizeStatusCode(mixed $statusCode): ?int
+    {
+        return is_numeric($statusCode) ? (int)$statusCode : null;
+    }
+
+    private function normalizeDuration(mixed $durationMs): ?float
+    {
+        return is_numeric($durationMs) ? max(0, round((float)$durationMs)) : null;
+    }
+
+    private function normalizeMetricName(mixed $metricName): string
+    {
+        $val = trim((string)($metricName ?? ''));
+        return mb_strlen($val) > 200 ? mb_substr($val, 0, 200) : $val;
+    }
+
+    #endregion
 }
 
-function audit(): AuditCore
+#endregion
+
+#region Middleware / HTTP Interceptor
+
+class AuditGuzzleMiddleware
 {
-    return AuditCore::getInstance();
+    private AuditCore $auditCore;
+
+    public function __construct(?AuditCore $auditCore = null)
+    {
+        $this->auditCore = $auditCore ?? AuditCore::getInstance();
+    }
+
+    public function __invoke(callable $handler): callable
+    {
+        return function ($request, array $options) use ($handler) {
+            $requestUrl = (string) $request->getUri();
+            
+            if (!empty($requestUrl) && $this->auditCore->isIngestUrl($requestUrl)) {
+                return $handler($request, $options);
+            }
+
+            $method = mb_strtoupper($request->getMethod());
+            $requestId = $this->auditCore->createRequestId();
+            $traceId = $this->auditCore->createTraceId();
+            $spanId = $this->auditCore->createSpanId();
+
+            $request = $request
+                ->withHeader('x-devinspector-request-id', $requestId)
+                ->withHeader('x-devinspector-trace-id', $traceId)
+                ->withHeader('x-devinspector-span-id', $spanId);
+
+            $startTime = microtime(true);
+
+            return $handler($request, $options)->then(
+                function ($response) use ($method, $requestUrl, $requestId, $traceId, $spanId, $startTime, $request) {
+                    $durationMs = round((microtime(true) - $startTime) * 1000);
+                    $statusCode = $response->getStatusCode();
+
+                    $this->auditCore->addBreadcrumb(new Breadcrumb(
+                        'http',
+                        "{$method} {$requestUrl}",
+                        [
+                            'phase' => 'complete',
+                            'statusCode' => $statusCode,
+                            'durationMs' => $durationMs,
+                            'requestId' => $requestId,
+                            'traceId' => $traceId,
+                            'spanId' => $spanId
+                        ]
+                    ));
+
+                    if ($statusCode >= 400 || $durationMs >= $this->auditCore->getSlowThresholdMs()) {
+                        $reqData = new RequestMetricData();
+                        $reqData->method = $method;
+                        $reqData->url = $requestUrl;
+                        $reqData->statusCode = $statusCode;
+                        $reqData->durationMs = $durationMs;
+                        $reqData->userAgent = $request->getHeaderLine('User-Agent');
+                        $reqData->requestId = $requestId;
+                        $reqData->traceId = $traceId;
+                        $reqData->spanId = $spanId;
+
+                        $this->auditCore->captureRequest($reqData);
+                    }
+
+                    return $response;
+                },
+                function ($reason) use ($method, $requestUrl, $requestId, $traceId, $spanId, $startTime, $request) {
+                    $durationMs = round((microtime(true) - $startTime) * 1000);
+
+                    $this->auditCore->addBreadcrumb(new Breadcrumb(
+                        'http_error',
+                        "{$method} {$requestUrl}",
+                        [
+                            'phase' => 'error',
+                            'statusCode' => 0,
+                            'durationMs' => $durationMs,
+                            'requestId' => $requestId,
+                            'traceId' => $traceId,
+                            'spanId' => $spanId
+                        ]
+                    ));
+
+                    $reqData = new RequestMetricData();
+                    $reqData->method = $method;
+                    $reqData->url = $requestUrl;
+                    $reqData->statusCode = 0;
+                    $reqData->durationMs = $durationMs;
+                    $reqData->userAgent = $request->getHeaderLine('User-Agent');
+                    $reqData->requestId = $requestId;
+                    $reqData->traceId = $traceId;
+                    $reqData->spanId = $spanId;
+
+                    $this->auditCore->captureRequest($reqData);
+
+                    if ($reason instanceof Throwable) {
+                        $this->auditCore->captureError($reason, [
+                            'url' => $requestUrl,
+                            'method' => $method
+                        ]);
+                    }
+
+                    return \GuzzleHttp\Promise\Create::rejectionFor($reason);
+                }
+            );
+        };
+    }
 }
